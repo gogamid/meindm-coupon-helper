@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">dm Coupon Helper</string>
+    <string name="service_label">dm Coupon Helper</string>
+    <string name="service_description">Activates available coupons in the Mein dm Coupons tab by pressing their Aktivieren button and notifies you when Mein dm confirms the activation. It never presses Deaktivieren and sends no data anywhere.</string>
+</resources>
