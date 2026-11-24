@@ -5,7 +5,6 @@ import android.accessibilityservice.GestureDescription;
 import android.app.Notification;
 import android.app.NotificationChannel;
 import android.app.NotificationManager;
-import android.content.Context;
 import android.graphics.Path;
 import android.graphics.Rect;
 import android.os.Handler;
@@ -14,31 +13,43 @@ import android.os.SystemClock;
 import android.view.accessibility.AccessibilityEvent;
 import android.view.accessibility.AccessibilityNodeInfo;
 
+import java.util.ArrayDeque;
+import java.util.Deque;
 import java.util.HashMap;
 import java.util.Map;
 
 /**
  * Activates available coupons in the official Mein dm app by pressing their
- * Aktivieren button. It never presses Deaktivieren and does not touch the app
- * itself. A notification is posted only when Mein dm shows its own success
- * message for an activation.
+ * Aktivieren button. Success is read from the same button turning into
+ * Deaktivieren, so up to two coupons can be in flight at once. It never presses
+ * Deaktivieren and does not touch the app itself.
  */
 public final class CouponAccessibilityService extends AccessibilityService {
     private static final String TARGET_PACKAGE = "de.dm.meindm.android";
     private static final String ACTIVATE = "Aktivieren";
     private static final String DEACTIVATE = "Deaktivieren";
-    private static final String SUCCESS = "Dein Coupon wurde erfolgreich aktiviert";
     private static final String CHANNEL_ID = "dm_coupon_helper";
     private static final int NOTIFICATION_ID = 0x6463;
-    private static final long CLICK_COOLDOWN_MS = 1_500;
-    private static final long SAME_BUTTON_COOLDOWN_MS = 60_000;
-    private static final long CONFIRM_TIMEOUT_MS = 12_000;
+    private static final int MAX_IN_FLIGHT = 2;
+    private static final long CLICK_COOLDOWN_MS = 600;
+    private static final long SAME_BUTTON_COOLDOWN_MS = 45_000;
+    private static final long PENDING_TIMEOUT_MS = 10_000;
+    private static final long SCAN_DEBOUNCE_MS = 120;
+
+    private static final class Pending {
+        final String bounds;
+        final long at;
+
+        Pending(String bounds, long at) {
+            this.bounds = bounds;
+            this.at = at;
+        }
+    }
 
     private final Handler handler = new Handler(Looper.getMainLooper());
     private final Map<String, Long> lastClickByBounds = new HashMap<>();
+    private final Deque<Pending> pending = new ArrayDeque<>();
     private long lastClickAt;
-    private boolean awaitingConfirmation;
-    private long awaitingSince;
     private int confirmed;
 
     private final Runnable scanTask = this::scan;
@@ -56,7 +67,7 @@ public final class CouponAccessibilityService extends AccessibilityService {
             return;
         }
         handler.removeCallbacks(scanTask);
-        handler.postDelayed(scanTask, 350);
+        handler.postDelayed(scanTask, SCAN_DEBOUNCE_MS);
     }
 
     @Override
@@ -69,30 +80,24 @@ public final class CouponAccessibilityService extends AccessibilityService {
             return;
         }
         long now = SystemClock.uptimeMillis();
-        boolean successVisible = containsText(root, SUCCESS);
 
-        if (awaitingConfirmation) {
-            if (successVisible) {
-                awaitingConfirmation = false;
-                confirmed++;
-                notifyCount();
-            } else if (now - awaitingSince > CONFIRM_TIMEOUT_MS) {
-                awaitingConfirmation = false;
-            } else {
-                return;
+        while (!pending.isEmpty() && now - pending.peekFirst().at > PENDING_TIMEOUT_MS) {
+            pending.removeFirst();
+        }
+        pending.removeIf(p -> hasLabelAtBounds(root, p.bounds, DEACTIVATE));
+
+        while (!pending.isEmpty() && hasLabelAtBounds(root, pending.peekFirst().bounds, DEACTIVATE)) {
+            pending.removeFirst();
+            confirmed++;
+            notifyCount();
+        }
+
+        while (pending.size() < MAX_IN_FLIGHT && now - lastClickAt >= CLICK_COOLDOWN_MS) {
+            AccessibilityNodeInfo button = findActivateButton(root, now);
+            if (button == null || !press(button)) {
+                break;
             }
-        }
-        if (now - lastClickAt < CLICK_COOLDOWN_MS) {
-            return;
-        }
-        AccessibilityNodeInfo button = findActivateButton(root, now);
-        if (button == null) {
-            return;
-        }
-        if (press(button)) {
             lastClickAt = now;
-            awaitingConfirmation = true;
-            awaitingSince = now;
         }
     }
 
@@ -100,15 +105,14 @@ public final class CouponAccessibilityService extends AccessibilityService {
         if (node == null || !node.isVisibleToUser()) {
             return null;
         }
-        CharSequence text = node.getText();
-        CharSequence description = node.getContentDescription();
-        if (matchesActivate(text) || matchesActivate(description)) {
+        if (matches(node.getText(), ACTIVATE) || matches(node.getContentDescription(), ACTIVATE)) {
             Rect bounds = new Rect();
             node.getBoundsInScreen(bounds);
             String key = bounds.flattenToString();
             Long previous = lastClickByBounds.get(key);
-            if (previous == null || now - previous > SAME_BUTTON_COOLDOWN_MS) {
+            if ((previous == null || now - previous > SAME_BUTTON_COOLDOWN_MS) && !isPending(key)) {
                 lastClickByBounds.put(key, now);
+                pending.addLast(new Pending(key, now));
                 return node;
             }
         }
@@ -121,12 +125,35 @@ public final class CouponAccessibilityService extends AccessibilityService {
         return null;
     }
 
-    private static boolean matchesActivate(CharSequence value) {
-        if (value == null) {
+    private boolean isPending(String bounds) {
+        for (Pending p : pending) {
+            if (p.bounds.equals(bounds)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static boolean matches(CharSequence value, String expected) {
+        return value != null && expected.contentEquals(value.toString().trim());
+    }
+
+    private boolean hasLabelAtBounds(AccessibilityNodeInfo node, String boundsKey, String label) {
+        if (node == null) {
             return false;
         }
-        String label = value.toString().trim();
-        return label.equalsIgnoreCase(ACTIVATE) && !label.equalsIgnoreCase(DEACTIVATE);
+        Rect bounds = new Rect();
+        node.getBoundsInScreen(bounds);
+        if (boundsKey.equals(bounds.flattenToString())
+                && (matches(node.getText(), label) || matches(node.getContentDescription(), label))) {
+            return true;
+        }
+        for (int i = 0; i < node.getChildCount(); i++) {
+            if (hasLabelAtBounds(node.getChild(i), boundsKey, label)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private boolean press(AccessibilityNodeInfo node) {
@@ -148,22 +175,6 @@ public final class CouponAccessibilityService extends AccessibilityService {
                 .addStroke(new GestureDescription.StrokeDescription(path, 0, 60))
                 .build();
         return dispatchGesture(gesture, null, null);
-    }
-
-    private boolean containsText(AccessibilityNodeInfo node, String expected) {
-        if (node == null) {
-            return false;
-        }
-        CharSequence text = node.getText();
-        if (text != null && expected.contentEquals(text)) {
-            return true;
-        }
-        for (int i = 0; i < node.getChildCount(); i++) {
-            if (containsText(node.getChild(i), expected)) {
-                return true;
-            }
-        }
-        return false;
     }
 
     private void createChannel() {
